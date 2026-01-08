@@ -1,20 +1,18 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
+import { pool } from '../config/database';
 import {
     authenticate,
     asyncHandler,
     ValidationError,
+    UnauthorizedError,
     generateToken,
     generateRefreshToken
 } from '../middleware';
-import { User, Role } from '../types';
+import { logger } from '../utils/logger';
 
 const router = Router();
-
-// In-memory user store for development
-// Replace with actual database in production
-const users = new Map<string, User & { passwordHash?: string }>();
 
 /**
  * @route POST /api/v1/auth/register
@@ -33,27 +31,45 @@ router.post('/register', asyncHandler(async (req: Request, res: Response) => {
         throw new ValidationError('Password must be at least 8 characters');
     }
 
+    const emailLower = email.toLowerCase().trim();
+
     // Check if user exists
-    const existingUser = Array.from(users.values()).find(u => u.email === email);
-    if (existingUser) {
+    const existingUser = await pool.request()
+        .input('email', emailLower)
+        .query('SELECT id FROM users WHERE email = @email');
+
+    if (existingUser.recordset.length > 0) {
         throw new ValidationError('User with this email already exists');
     }
 
     // Hash password
     const passwordHash = await bcrypt.hash(password, 12);
 
-    // Create user
-    const user: User & { passwordHash: string } = {
-        id: uuidv4(),
-        email: email.toLowerCase(),
-        name,
-        passwordHash,
-        emailVerified: false,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-    };
+    // Generate email verification token
+    const verificationToken = crypto.randomBytes(32).toString('hex');
 
-    users.set(user.id, user);
+    // Create user
+    const result = await pool.request()
+        .input('email', emailLower)
+        .input('name', name)
+        .input('password_hash', passwordHash)
+        .input('email_verified', false)
+        .query(`
+            INSERT INTO users (id, email, name, password_hash, email_verified, created_at, updated_at)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @email, @name, @password_hash, @email_verified, GETUTCDATE(), GETUTCDATE())
+        `);
+
+    const user = result.recordset[0];
+
+    logger.info('User registered', { userId: user.id, email: user.email });
+
+    // TODO: Send verification email with verificationToken
+    // For now, we'll just log it
+    logger.info('Email verification token (implement email sending)', {
+        userId: user.id,
+        token: verificationToken
+    });
 
     // Generate tokens
     const accessToken = generateToken({
@@ -63,6 +79,20 @@ router.post('/register', asyncHandler(async (req: Request, res: Response) => {
     });
     const refreshToken = generateRefreshToken(user.id);
 
+    // Store refresh token
+    const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
+
+    await pool.request()
+        .input('user_id', user.id)
+        .input('token_hash', refreshTokenHash)
+        .input('expires_at', expiresAt)
+        .query(`
+            INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at)
+            VALUES (NEWID(), @user_id, @token_hash, @expires_at, GETUTCDATE())
+        `);
+
     res.status(201).json({
         success: true,
         data: {
@@ -70,10 +100,47 @@ router.post('/register', asyncHandler(async (req: Request, res: Response) => {
                 id: user.id,
                 email: user.email,
                 name: user.name,
-                emailVerified: user.emailVerified,
+                emailVerified: user.email_verified,
             },
             accessToken,
             refreshToken,
+        },
+        message: 'Registration successful. Please check your email to verify your account.'
+    });
+}));
+
+/**
+ * @route POST /api/v1/auth/verify-email
+ * @desc Verify user email with token
+ * @access Public
+ */
+router.post('/verify-email', asyncHandler(async (req: Request, res: Response) => {
+    const { token, email } = req.body;
+
+    if (!token || !email) {
+        throw new ValidationError('Token and email are required');
+    }
+
+    // TODO: Implement actual token verification
+    // For now, we'll just mark the email as verified
+    const result = await pool.request()
+        .input('email', email.toLowerCase())
+        .query(`
+            UPDATE users
+            SET email_verified = 1, updated_at = GETUTCDATE()
+            WHERE email = @email
+        `);
+
+    if (result.rowsAffected[0] === 0) {
+        throw new ValidationError('Invalid verification token or email');
+    }
+
+    logger.info('Email verified', { email });
+
+    res.json({
+        success: true,
+        data: {
+            message: 'Email verified successfully',
         },
     });
 }));
@@ -81,7 +148,7 @@ router.post('/register', asyncHandler(async (req: Request, res: Response) => {
 /**
  * @route POST /api/v1/auth/login
  * @desc Login user
- * @access Public
+ * @access Private
  */
 router.post('/login', asyncHandler(async (req: Request, res: Response) => {
     const { email, password } = req.body;
@@ -91,19 +158,28 @@ router.post('/login', asyncHandler(async (req: Request, res: Response) => {
     }
 
     // Find user
-    const user = Array.from(users.values()).find(u => u.email === email.toLowerCase());
-    if (!user || !user.passwordHash) {
-        throw new ValidationError('Invalid email or password');
+    const result = await pool.request()
+        .input('email', email.toLowerCase())
+        .query('SELECT * FROM users WHERE email = @email');
+
+    const user = result.recordset[0];
+
+    if (!user || !user.password_hash) {
+        throw new UnauthorizedError('Invalid email or password');
     }
 
     // Verify password
-    const isValid = await bcrypt.compare(password, user.passwordHash);
+    const isValid = await bcrypt.compare(password, user.password_hash);
     if (!isValid) {
-        throw new ValidationError('Invalid email or password');
+        throw new UnauthorizedError('Invalid email or password');
     }
 
     // Update last login
-    user.lastLoginAt = new Date();
+    await pool.request()
+        .input('user_id', user.id)
+        .query('UPDATE users SET last_login_at = GETUTCDATE() WHERE id = @user_id');
+
+    logger.info('User logged in', { userId: user.id, email: user.email });
 
     // Generate tokens
     const accessToken = generateToken({
@@ -113,6 +189,20 @@ router.post('/login', asyncHandler(async (req: Request, res: Response) => {
     });
     const refreshToken = generateRefreshToken(user.id);
 
+    // Store refresh token
+    const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
+
+    await pool.request()
+        .input('user_id', user.id)
+        .input('token_hash', refreshTokenHash)
+        .input('expires_at', expiresAt)
+        .query(`
+            INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at)
+            VALUES (NEWID(), @user_id, @token_hash, @expires_at, GETUTCDATE())
+        `);
+
     res.json({
         success: true,
         data: {
@@ -120,8 +210,8 @@ router.post('/login', asyncHandler(async (req: Request, res: Response) => {
                 id: user.id,
                 email: user.email,
                 name: user.name,
-                emailVerified: user.emailVerified,
-                avatarUrl: user.avatarUrl,
+                emailVerified: user.email_verified,
+                avatarUrl: user.avatar_url,
             },
             accessToken,
             refreshToken,
@@ -141,13 +231,39 @@ router.post('/refresh', asyncHandler(async (req: Request, res: Response) => {
         throw new ValidationError('Refresh token is required');
     }
 
-    // TODO: Validate refresh token from database
-    // For now, we just generate a new access token
+    // Verify refresh token exists and is not expired
+    const tokens = await pool.request()
+        .query(`
+            SELECT rt.*, u.id as user_id, u.email, u.name
+            FROM refresh_tokens rt
+            JOIN users u ON rt.user_id = u.id
+            WHERE rt.expires_at > GETUTCDATE() AND rt.revoked_at IS NULL
+        `);
+
+    let validToken = null;
+    for (const token of tokens.recordset) {
+        const isValid = await bcrypt.compare(refreshToken, token.token_hash);
+        if (isValid) {
+            validToken = token;
+            break;
+        }
+    }
+
+    if (!validToken) {
+        throw new UnauthorizedError('Invalid or expired refresh token');
+    }
+
+    // Generate new access token
+    const accessToken = generateToken({
+        id: validToken.user_id,
+        email: validToken.email,
+        name: validToken.name
+    });
 
     res.json({
         success: true,
         data: {
-            message: 'Token refresh not fully implemented in development mode',
+            accessToken,
         },
     });
 }));
@@ -158,7 +274,11 @@ router.post('/refresh', asyncHandler(async (req: Request, res: Response) => {
  * @access Private
  */
 router.get('/me', authenticate, asyncHandler(async (req: Request, res: Response) => {
-    const user = users.get(req.user!.id);
+    const result = await pool.request()
+        .input('user_id', req.user!.id)
+        .query('SELECT id, email, name, avatar_url, email_verified, created_at FROM users WHERE id = @user_id');
+
+    const user = result.recordset[0];
 
     if (!user) {
         res.status(404).json({
@@ -177,9 +297,9 @@ router.get('/me', authenticate, asyncHandler(async (req: Request, res: Response)
             id: user.id,
             email: user.email,
             name: user.name,
-            avatarUrl: user.avatarUrl,
-            emailVerified: user.emailVerified,
-            createdAt: user.createdAt,
+            avatarUrl: user.avatar_url,
+            emailVerified: user.email_verified,
+            createdAt: user.created_at,
         },
     });
 }));
@@ -191,22 +311,37 @@ router.get('/me', authenticate, asyncHandler(async (req: Request, res: Response)
  */
 router.put('/me', authenticate, asyncHandler(async (req: Request, res: Response) => {
     const { name, avatarUrl } = req.body;
-    const user = users.get(req.user!.id);
 
-    if (!user) {
-        res.status(404).json({
-            success: false,
-            error: {
-                code: 'USER_NOT_FOUND',
-                message: 'User not found',
-            },
-        });
-        return;
+    const updates: string[] = [];
+    const request = pool.request().input('user_id', req.user!.id);
+
+    if (name) {
+        updates.push('name = @name');
+        request.input('name', name);
+    }
+    if (avatarUrl !== undefined) {
+        updates.push('avatar_url = @avatar_url');
+        request.input('avatar_url', avatarUrl);
+    }
+    updates.push('updated_at = GETUTCDATE()');
+
+    if (updates.length === 1) {
+        throw new ValidationError('No valid fields to update');
     }
 
-    if (name) user.name = name;
-    if (avatarUrl !== undefined) user.avatarUrl = avatarUrl;
-    user.updatedAt = new Date();
+    await request.query(`
+        UPDATE users
+        SET ${updates.join(', ')}
+        WHERE id = @user_id
+    `);
+
+    const result = await pool.request()
+        .input('user_id', req.user!.id)
+        .query('SELECT id, email, name, avatar_url FROM users WHERE id = @user_id');
+
+    const user = result.recordset[0];
+
+    logger.info('User profile updated', { userId: user.id });
 
     res.json({
         success: true,
@@ -214,7 +349,7 @@ router.put('/me', authenticate, asyncHandler(async (req: Request, res: Response)
             id: user.id,
             email: user.email,
             name: user.name,
-            avatarUrl: user.avatarUrl,
+            avatarUrl: user.avatar_url,
         },
     });
 }));
@@ -225,7 +360,26 @@ router.put('/me', authenticate, asyncHandler(async (req: Request, res: Response)
  * @access Private
  */
 router.post('/logout', authenticate, asyncHandler(async (req: Request, res: Response) => {
-    // TODO: Invalidate refresh token in database
+    const { refreshToken } = req.body;
+
+    if (refreshToken) {
+        // Revoke refresh token
+        const tokens = await pool.request()
+            .input('user_id', req.user!.id)
+            .query('SELECT * FROM refresh_tokens WHERE user_id = @user_id AND revoked_at IS NULL');
+
+        for (const token of tokens.recordset) {
+            const isValid = await bcrypt.compare(refreshToken, token.token_hash);
+            if (isValid) {
+                await pool.request()
+                    .input('token_id', token.id)
+                    .query('UPDATE refresh_tokens SET revoked_at = GETUTCDATE() WHERE id = @token_id');
+                break;
+            }
+        }
+    }
+
+    logger.info('User logged out', { userId: req.user!.id });
 
     res.json({
         success: true,
@@ -247,8 +401,22 @@ router.post('/forgot-password', asyncHandler(async (req: Request, res: Response)
         throw new ValidationError('Email is required');
     }
 
-    // TODO: Send password reset email
+    const user = await pool.request()
+        .input('email', email.toLowerCase())
+        .query('SELECT id, email FROM users WHERE email = @email');
 
+    if (user.recordset.length > 0) {
+        // Generate reset token
+        const resetToken = crypto.randomBytes(32).toString('hex');
+
+        // TODO: Store reset token and send email
+        logger.info('Password reset requested', {
+            userId: user.recordset[0].id,
+            token: resetToken
+        });
+    }
+
+    // Always return success to prevent email enumeration
     res.json({
         success: true,
         data: {

@@ -1,31 +1,32 @@
 import { Router, Request, Response } from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
+import { pool } from '../config/database';
 import {
     authenticate,
     asyncHandler,
     requireOwner,
     requireAdmin,
+    requireMinRole,
     ValidationError,
     NotFoundError,
     ConflictError,
     generateToken
 } from '../middleware';
-import { Tenant, TenantStatus, Role, TenantMember } from '../types';
+import { TenantStatus, Role } from '../types';
+import { logger } from '../utils/logger';
 
 const router = Router();
-
-// In-memory stores for development
-const tenants = new Map<string, Tenant>();
-const tenantMembers = new Map<string, TenantMember>();
 
 /**
  * Helper: Generate URL-friendly slug
  */
 const generateSlug = (name: string): string => {
-    return name
+    const base = name
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-|-$/g, '') + '-' + uuidv4().substring(0, 8);
+        .replace(/^-|-$/g, '');
+    const random = crypto.randomBytes(4).toString('hex');
+    return `${base}-${random}`;
 };
 
 /**
@@ -43,38 +44,44 @@ router.post('/', authenticate, asyncHandler(async (req: Request, res: Response) 
 
     // Check slug uniqueness
     const finalSlug = slug || generateSlug(name);
-    const existingTenant = Array.from(tenants.values()).find(t => t.slug === finalSlug);
-    if (existingTenant) {
+
+    const existingTenant = await pool.request()
+        .input('slug', finalSlug)
+        .query('SELECT id FROM tenants WHERE slug = @slug');
+
+    if (existingTenant.recordset.length > 0) {
         throw new ConflictError('A tenant with this slug already exists');
     }
 
     // Create tenant
-    const tenant: Tenant = {
-        id: uuidv4(),
-        name: name.trim(),
-        slug: finalSlug,
-        status: TenantStatus.ACTIVE,
-        ownerId: userId,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-    };
+    const tenantResult = await pool.request()
+        .input('name', name.trim())
+        .input('slug', finalSlug)
+        .input('status', TenantStatus.ACTIVE)
+        .input('owner_id', userId)
+        .query(`
+            INSERT INTO tenants (id, name, slug, status, owner_id, created_at, updated_at)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @name, @slug, @status, @owner_id, GETUTCDATE(), GETUTCDATE())
+        `);
 
-    tenants.set(tenant.id, tenant);
+    const tenant = tenantResult.recordset[0];
 
     // Add creator as owner
-    const membership: TenantMember = {
-        id: uuidv4(),
-        tenantId: tenant.id,
-        userId: userId,
-        role: Role.OWNER,
-        joinedAt: new Date(),
-        invitedBy: userId,
-        isSuspended: false,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-    };
+    const membershipResult = await pool.request()
+        .input('tenant_id', tenant.id)
+        .input('user_id', userId)
+        .input('role', Role.OWNER)
+        .input('invited_by', userId)
+        .query(`
+            INSERT INTO tenant_members (id, tenant_id, user_id, role, joined_at, invited_by, is_suspended, created_at, updated_at)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @tenant_id, @user_id, @role, GETUTCDATE(), @invited_by, 0, GETUTCDATE(), GETUTCDATE())
+        `);
 
-    tenantMembers.set(membership.id, membership);
+    const membership = membershipResult.recordset[0];
+
+    logger.info('Tenant created', { tenantId: tenant.id, userId, name: tenant.name });
 
     // Generate new token with tenant context
     const newToken = generateToken(req.user!, tenant.id, Role.OWNER);
@@ -82,8 +89,22 @@ router.post('/', authenticate, asyncHandler(async (req: Request, res: Response) 
     res.status(201).json({
         success: true,
         data: {
-            tenant,
-            membership,
+            tenant: {
+                id: tenant.id,
+                name: tenant.name,
+                slug: tenant.slug,
+                status: tenant.status,
+                ownerId: tenant.owner_id,
+                createdAt: tenant.created_at,
+                updatedAt: tenant.updated_at,
+            },
+            membership: {
+                id: membership.id,
+                tenantId: membership.tenant_id,
+                userId: membership.user_id,
+                role: membership.role,
+                joinedAt: membership.joined_at,
+            },
             accessToken: newToken,
         },
     });
@@ -97,61 +118,79 @@ router.post('/', authenticate, asyncHandler(async (req: Request, res: Response) 
 router.get('/', authenticate, asyncHandler(async (req: Request, res: Response) => {
     const userId = req.user!.id;
 
-    // Find user's memberships
-    const userMemberships = Array.from(tenantMembers.values())
-        .filter(m => m.userId === userId && !m.isSuspended);
+    const result = await pool.request()
+        .input('user_id', userId)
+        .query(`
+            SELECT 
+                t.id, t.name, t.slug, t.status, t.owner_id, t.created_at, t.updated_at,
+                tm.role, tm.joined_at, tm.is_suspended
+            FROM tenants t
+            INNER JOIN tenant_members tm ON t.id = tm.tenant_id
+            WHERE tm.user_id = @user_id AND tm.is_suspended = 0
+            ORDER BY t.created_at DESC
+        `);
 
-    // Get tenant details
-    const userTenants = userMemberships.map(m => {
-        const tenant = tenants.get(m.tenantId);
-        return {
-            ...tenant,
-            role: m.role,
-            joinedAt: m.joinedAt,
-        };
-    }).filter(t => t && t.status === TenantStatus.ACTIVE);
+    const tenants = result.recordset.map(row => ({
+        tenant: {
+            id: row.id,
+            name: row.name,
+            slug: row.slug,
+            status: row.status,
+            ownerId: row.owner_id,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+        },
+        role: row.role,
+        joinedAt: row.joined_at,
+        isSuspended: row.is_suspended,
+    }));
 
     res.json({
         success: true,
-        data: userTenants,
-        meta: {
-            total: userTenants.length,
-        },
+        data: tenants,
     });
 }));
 
 /**
  * @route GET /api/v1/tenants/:tenantId
  * @desc Get tenant details
- * @access Private (member)
+ * @access Private (Member)
  */
 router.get('/:tenantId', authenticate, asyncHandler(async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     const userId = req.user!.id;
 
-    const tenant = tenants.get(tenantId);
-    if (!tenant || tenant.status === TenantStatus.DELETED) {
-        throw new NotFoundError('Tenant', tenantId);
+    // Verify user is a member
+    const membershipCheck = await pool.request()
+        .input('tenant_id', tenantId)
+        .input('user_id', userId)
+        .query('SELECT id FROM tenant_members WHERE tenant_id = @tenant_id AND user_id = @user_id AND is_suspended = 0');
+
+    if (membershipCheck.recordset.length === 0) {
+        throw new NotFoundError('Tenant not found or access denied');
     }
 
-    // Check membership
-    const membership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
+    const result = await pool.request()
+        .input('tenant_id', tenantId)
+        .query('SELECT * FROM tenants WHERE id = @tenant_id');
 
-    if (!membership) {
-        throw new NotFoundError('Tenant', tenantId);
+    const tenant = result.recordset[0];
+
+    if (!tenant) {
+        throw new NotFoundError('Tenant not found');
     }
-
-    // Count members
-    const memberCount = Array.from(tenantMembers.values())
-        .filter(m => m.tenantId === tenantId && !m.isSuspended).length;
 
     res.json({
         success: true,
         data: {
-            ...tenant,
-            role: membership.role,
-            memberCount,
+            id: tenant.id,
+            name: tenant.name,
+            slug: tenant.slug,
+            status: tenant.status,
+            ownerId: tenant.owner_id,
+            settings: tenant.settings,
+            createdAt: tenant.created_at,
+            updatedAt: tenant.updated_at,
         },
     });
 }));
@@ -159,74 +198,77 @@ router.get('/:tenantId', authenticate, asyncHandler(async (req: Request, res: Re
 /**
  * @route PUT /api/v1/tenants/:tenantId
  * @desc Update tenant details
- * @access Private (admin+)
+ * @access Private (Admin+)
  */
-router.put('/:tenantId', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.put('/:tenantId', authenticate, requireMinRole(Role.ADMIN), asyncHandler(async (req: Request, res: Response) => {
     const { tenantId } = req.params;
-    const { name, logoUrl, settings } = req.body;
-    const userId = req.user!.id;
+    const { name, settings } = req.body;
 
-    const tenant = tenants.get(tenantId);
-    if (!tenant || tenant.status === TenantStatus.DELETED) {
-        throw new NotFoundError('Tenant', tenantId);
+    const updates: string[] = [];
+    const request = pool.request().input('tenant_id', tenantId);
+
+    if (name) {
+        if (name.trim().length < 2) {
+            throw new ValidationError('Tenant name must be at least 2 characters');
+        }
+        updates.push('name = @name');
+        request.input('name', name.trim());
     }
 
-    // Check admin access
-    const membership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
-
-    if (!membership || (membership.role !== Role.OWNER && membership.role !== Role.ADMIN)) {
-        res.status(403).json({
-            success: false,
-            error: {
-                code: 'FORBIDDEN',
-                message: 'Admin access required to update tenant',
-            },
-        });
-        return;
+    if (settings) {
+        updates.push('settings = @settings');
+        request.input('settings', JSON.stringify(settings));
     }
 
-    // Update fields
-    if (name) tenant.name = name.trim();
-    if (logoUrl !== undefined) tenant.logoUrl = logoUrl;
-    if (settings) tenant.settings = { ...tenant.settings, ...settings };
-    tenant.updatedAt = new Date();
+    if (updates.length === 0) {
+        throw new ValidationError('No valid fields to update');
+    }
+
+    updates.push('updated_at = GETUTCDATE()');
+
+    await request.query(`
+        UPDATE tenants
+        SET ${updates.join(', ')}
+        WHERE id = @tenant_id
+    `);
+
+    const result = await pool.request()
+        .input('tenant_id', tenantId)
+        .query('SELECT * FROM tenants WHERE id = @tenant_id');
+
+    const tenant = result.recordset[0];
+
+    logger.info('Tenant updated', { tenantId, userId: req.user!.id });
 
     res.json({
         success: true,
-        data: tenant,
+        data: {
+            id: tenant.id,
+            name: tenant.name,
+            slug: tenant.slug,
+            status: tenant.status,
+            ownerId: tenant.owner_id,
+            settings: tenant.settings,
+            createdAt: tenant.created_at,
+            updatedAt: tenant.updated_at,
+        },
     });
 }));
 
 /**
  * @route DELETE /api/v1/tenants/:tenantId
- * @desc Delete tenant (soft delete)
- * @access Private (owner only)
+ * @desc Delete tenant (owner only)
+ * @access Private (Owner)
  */
-router.delete('/:tenantId', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.delete('/:tenantId', authenticate, requireOwner, asyncHandler(async (req: Request, res: Response) => {
     const { tenantId } = req.params;
-    const userId = req.user!.id;
 
-    const tenant = tenants.get(tenantId);
-    if (!tenant || tenant.status === TenantStatus.DELETED) {
-        throw new NotFoundError('Tenant', tenantId);
-    }
+    // Delete all related data (cascade will handle most)
+    await pool.request()
+        .input('tenant_id', tenantId)
+        .query('DELETE FROM tenants WHERE id = @tenant_id');
 
-    // Check owner access
-    if (tenant.ownerId !== userId) {
-        res.status(403).json({
-            success: false,
-            error: {
-                code: 'FORBIDDEN',
-                message: 'Only the owner can delete a tenant',
-            },
-        });
-        return;
-    }
-
-    // Soft delete
-    tenant.status = TenantStatus.DELETED;
-    tenant.updatedAt = new Date();
+    logger.info('Tenant deleted', { tenantId, userId: req.user!.id });
 
     res.json({
         success: true,
@@ -238,32 +280,24 @@ router.delete('/:tenantId', authenticate, asyncHandler(async (req: Request, res:
 
 /**
  * @route POST /api/v1/tenants/:tenantId/switch
- * @desc Switch to a tenant context
- * @access Private (member)
+ * @desc Switch active tenant context
+ * @access Private (Member)
  */
 router.post('/:tenantId/switch', authenticate, asyncHandler(async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     const userId = req.user!.id;
 
-    const tenant = tenants.get(tenantId);
-    if (!tenant || tenant.status !== TenantStatus.ACTIVE) {
-        throw new NotFoundError('Tenant', tenantId);
+    // Verify membership
+    const result = await pool.request()
+        .input('tenant_id', tenantId)
+        .input('user_id', userId)
+        .query('SELECT role FROM tenant_members WHERE tenant_id = @tenant_id AND user_id = @user_id AND is_suspended = 0');
+
+    if (result.recordset.length === 0) {
+        throw new NotFoundError('Tenant not found or access denied');
     }
 
-    // Check membership
-    const membership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
-
-    if (!membership) {
-        res.status(403).json({
-            success: false,
-            error: {
-                code: 'NOT_A_MEMBER',
-                message: 'You are not a member of this tenant',
-            },
-        });
-        return;
-    }
+    const membership = result.recordset[0];
 
     // Generate new token with tenant context
     const newToken = generateToken(req.user!, tenantId, membership.role);
@@ -271,13 +305,11 @@ router.post('/:tenantId/switch', authenticate, asyncHandler(async (req: Request,
     res.json({
         success: true,
         data: {
-            tenant,
-            role: membership.role,
             accessToken: newToken,
+            tenantId,
+            role: membership.role,
         },
     });
 }));
 
-// Export stores for use by other routes
-export { tenants, tenantMembers };
 export default router;

@@ -1,244 +1,310 @@
 import { Router, Request, Response } from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import { BlobServiceClient, generateBlobSASQueryParameters, BlobSASPermissions, StorageSharedKeyCredential } from '@azure/storage-blob';
 import multer from 'multer';
-import path from 'path';
+import crypto from 'crypto';
+import { pool } from '../config/database';
 import {
     authenticate,
-    asyncHandler,
     requireTenant,
+    requireMinRole,
+    asyncHandler,
     ValidationError,
     NotFoundError,
-    ForbiddenError
 } from '../middleware';
-import { Attachment, Role } from '../types';
-import { tenantMembers } from './tenants';
-import { notes } from './notes';
+import { Role } from '../types';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
-// In-memory attachments store
-const attachments = new Map<string, Attachment>();
-
-// Multer configuration for file uploads
-const storage = multer.memoryStorage();
-
-const fileFilter = (req: Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
-    // Allowed file types
-    const allowedTypes = [
-        'image/jpeg',
-        'image/png',
-        'image/gif',
-        'image/webp',
-        'application/pdf',
-        'application/msword',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'application/vnd.ms-excel',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'text/plain',
-        'text/csv',
-        'application/json',
-    ];
-
-    if (allowedTypes.includes(file.mimetype)) {
-        cb(null, true);
-    } else {
-        cb(new Error(`File type ${file.mimetype} is not allowed`));
-    }
-};
-
+// Configure multer for file uploads (memory storage)
 const upload = multer({
-    storage,
-    fileFilter,
+    storage: multer.memoryStorage(),
     limits: {
-        fileSize: 10 * 1024 * 1024, // 10MB
-        files: 5, // Max 5 files at once
+        fileSize: 10 * 1024 * 1024, // 10MB limit
     },
 });
 
+// Azure Blob Storage configuration
+const STORAGE_ACCOUNT = process.env.AZURE_STORAGE_ACCOUNT || '';
+const STORAGE_KEY = process.env.AZURE_STORAGE_KEY || '';
+const CONTAINER_NAME = 'attachments';
+
+let blobServiceClient: BlobServiceClient | null = null;
+
+if (STORAGE_ACCOUNT && STORAGE_KEY) {
+    const connectionString = `DefaultEndpointsProtocol=https;AccountName=${STORAGE_ACCOUNT};AccountKey=${STORAGE_KEY};EndpointSuffix=core.windows.net`;
+    blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
+}
+
 /**
- * Helper: Check tenant access
+ * Generate a SAS URL for blob access
  */
-const checkTenantAccess = (tenantId: string, userId: string): { role: Role } | null => {
-    const membership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
-    return membership ? { role: membership.role } : null;
+const generateSasUrl = (blobName: string): string => {
+    if (!blobServiceClient || !STORAGE_ACCOUNT || !STORAGE_KEY) {
+        throw new Error('Azure Storage not configured');
+    }
+
+    const sharedKeyCredential = new StorageSharedKeyCredential(STORAGE_ACCOUNT, STORAGE_KEY);
+    const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
+    const blobClient = containerClient.getBlobClient(blobName);
+
+    const sasToken = generateBlobSASQueryParameters(
+        {
+            containerName: CONTAINER_NAME,
+            blobName: blobName,
+            permissions: BlobSASPermissions.parse('r'), // read only
+            startsOn: new Date(),
+            expiresOn: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
+        },
+        sharedKeyCredential
+    ).toString();
+
+    return `${blobClient.url}?${sasToken}`;
 };
 
 /**
- * @route GET /api/v1/attachments
- * @desc Get all attachments for a note
- * @access Private (viewer+)
- */
-router.get('/', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
-    const { noteId } = req.query;
-    const tenantId = req.tenantId!;
-    const userId = req.user!.id;
-
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
-    }
-
-    let filteredAttachments = Array.from(attachments.values())
-        .filter(a => a.tenantId === tenantId && !a.isDeleted);
-
-    if (noteId) {
-        filteredAttachments = filteredAttachments.filter(a => a.noteId === noteId);
-    }
-
-    res.json({
-        success: true,
-        data: filteredAttachments,
-        meta: {
-            total: filteredAttachments.length,
-        },
-    });
-}));
-
-/**
  * @route POST /api/v1/attachments
- * @desc Upload attachments to a note
- * @access Private (editor+)
+ * @desc Upload an attachment
+ * @access Private (Editor+)
  */
-router.post('/', authenticate, requireTenant, upload.array('files', 5), asyncHandler(async (req: Request, res: Response) => {
+router.post('/', authenticate, requireTenant, requireMinRole(Role.EDITOR), upload.single('file'), asyncHandler(async (req: Request, res: Response) => {
+    const file = req.file;
     const { noteId } = req.body;
     const tenantId = req.tenantId!;
     const userId = req.user!.id;
+
+    if (!file) {
+        throw new ValidationError('File is required');
+    }
 
     if (!noteId) {
         throw new ValidationError('Note ID is required');
     }
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
-    }
-
-    if (access.role === Role.VIEWER) {
-        throw new ForbiddenError('Viewers cannot upload files');
-    }
-
     // Verify note exists and belongs to tenant
-    const note = notes.get(noteId);
-    if (!note || note.tenantId !== tenantId || note.isDeleted) {
-        throw new NotFoundError('Note', noteId);
+    const noteCheck = await pool.request()
+        .input('note_id', noteId)
+        .input('tenant_id', tenantId)
+        .query('SELECT id FROM notes WHERE id = @note_id AND tenant_id = @tenant_id AND is_deleted = 0');
+
+    if (noteCheck.recordset.length === 0) {
+        throw new NotFoundError('Note not found');
     }
 
-    const files = req.files as Express.Multer.File[];
-    if (!files || files.length === 0) {
-        throw new ValidationError('At least one file is required');
+    // Upload to Azure Blob Storage
+    if (!blobServiceClient) {
+        throw new Error('Azure Storage not configured');
     }
 
-    const uploadedAttachments: Attachment[] = [];
+    const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
 
-    for (const file of files) {
-        // Generate unique filename
-        const ext = path.extname(file.originalname);
-        const fileName = `${tenantId}/${noteId}/${uuidv4()}${ext}`;
+    // Generate unique blob name
+    const fileExtension = file.originalname.split('.').pop();
+    const blobName = `${tenantId}/${noteId}/${crypto.randomBytes(16).toString('hex')}.${fileExtension}`;
+    const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
-        // In production, upload to Azure Blob Storage
-        // const blobUrl = await uploadToAzureBlob(file.buffer, fileName, file.mimetype);
+    // Upload file
+    await blockBlobClient.uploadData(file.buffer, {
+        blobHTTPHeaders: {
+            blobContentType: file.mimetype,
+        },
+    });
 
-        // For development, we'll just store metadata
-        const blobUrl = `https://storage.example.com/${fileName}`;
+    const blobUrl = blockBlobClient.url;
 
-        const attachment: Attachment = {
-            id: uuidv4(),
-            tenantId,
-            noteId,
-            fileName,
-            originalName: file.originalname,
-            mimeType: file.mimetype,
-            sizeBytes: file.size,
-            blobUrl,
-            uploadedBy: userId,
-            isDeleted: false,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-        };
+    // Save attachment record
+    const result = await pool.request()
+        .input('note_id', noteId)
+        .input('file_name', file.originalname)
+        .input('file_size', file.size)
+        .input('mime_type', file.mimetype)
+        .input('blob_url', blobUrl)
+        .input('blob_name', blobName)
+        .input('uploaded_by', userId)
+        .query(`
+            INSERT INTO attachments (id, note_id, file_name, file_size, mime_type, blob_url, blob_name, uploaded_by, created_at, is_deleted)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @note_id, @file_name, @file_size, @mime_type, @blob_url, @blob_name, @uploaded_by, GETUTCDATE(), 0)
+        `);
 
-        attachments.set(attachment.id, attachment);
-        uploadedAttachments.push(attachment);
-    }
+    const attachment = result.recordset[0];
+
+    logger.info('Attachment uploaded', {
+        attachmentId: attachment.id,
+        noteId,
+        tenantId,
+        userId,
+        fileName: file.originalname,
+        fileSize: file.size
+    });
 
     res.status(201).json({
         success: true,
-        data: uploadedAttachments,
+        data: {
+            id: attachment.id,
+            noteId: attachment.note_id,
+            fileName: attachment.file_name,
+            fileSize: attachment.file_size,
+            mimeType: attachment.mime_type,
+            uploadedBy: attachment.uploaded_by,
+            createdAt: attachment.created_at,
+            downloadUrl: generateSasUrl(blobName),
+        },
     });
 }));
 
 /**
  * @route GET /api/v1/attachments/:attachmentId
- * @desc Get attachment details/download URL
- * @access Private (viewer+)
+ * @desc Get attachment details with download URL
+ * @access Private (Viewer+)
  */
 router.get('/:attachmentId', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
     const { attachmentId } = req.params;
     const tenantId = req.tenantId!;
-    const userId = req.user!.id;
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
+    // Get attachment and verify tenant access
+    const result = await pool.request()
+        .input('attachment_id', attachmentId)
+        .query(`
+            SELECT a.*, n.tenant_id
+            FROM attachments a
+            INNER JOIN notes n ON a.note_id = n.id
+            WHERE a.id = @attachment_id AND a.is_deleted = 0
+        `);
+
+    if (result.recordset.length === 0) {
+        throw new NotFoundError('Attachment not found');
     }
 
-    const attachment = attachments.get(attachmentId);
-    if (!attachment || attachment.tenantId !== tenantId || attachment.isDeleted) {
-        throw new NotFoundError('Attachment', attachmentId);
-    }
+    const attachment = result.recordset[0];
 
-    // In production, generate a time-limited SAS URL for secure download
-    // const downloadUrl = await generateSasUrl(attachment.blobUrl, 3600);
-    const downloadUrl = attachment.blobUrl + '?token=example-sas-token';
+    if (attachment.tenant_id !== tenantId) {
+        throw new NotFoundError('Attachment not found');
+    }
 
     res.json({
         success: true,
         data: {
-            ...attachment,
-            downloadUrl,
-            expiresAt: new Date(Date.now() + 3600 * 1000), // 1 hour
+            id: attachment.id,
+            noteId: attachment.note_id,
+            fileName: attachment.file_name,
+            fileSize: attachment.file_size,
+            mimeType: attachment.mime_type,
+            uploadedBy: attachment.uploaded_by,
+            createdAt: attachment.created_at,
+            downloadUrl: generateSasUrl(attachment.blob_name),
         },
+    });
+}));
+
+/**
+ * @route GET /api/v1/attachments
+ * @desc Get all attachments for a note
+ * @access Private (Viewer+)
+ */
+router.get('/', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+    const { noteId } = req.query;
+    const tenantId = req.tenantId!;
+
+    if (!noteId) {
+        throw new ValidationError('Note ID is required');
+    }
+
+    // Verify note belongs to tenant
+    const noteCheck = await pool.request()
+        .input('note_id', noteId as string)
+        .input('tenant_id', tenantId)
+        .query('SELECT id FROM notes WHERE id = @note_id AND tenant_id = @tenant_id');
+
+    if (noteCheck.recordset.length === 0) {
+        throw new NotFoundError('Note not found');
+    }
+
+    const result = await pool.request()
+        .input('note_id', noteId as string)
+        .query(`
+            SELECT a.*, u.name as uploader_name
+            FROM attachments a
+            LEFT JOIN users u ON a.uploaded_by = u.id
+            WHERE a.note_id = @note_id AND a.is_deleted = 0
+            ORDER BY a.created_at DESC
+        `);
+
+    const attachments = result.recordset.map(attachment => ({
+        id: attachment.id,
+        noteId: attachment.note_id,
+        fileName: attachment.file_name,
+        fileSize: attachment.file_size,
+        mimeType: attachment.mime_type,
+        uploadedBy: attachment.uploaded_by,
+        uploaderName: attachment.uploader_name,
+        createdAt: attachment.created_at,
+        downloadUrl: generateSasUrl(attachment.blob_name),
+    }));
+
+    res.json({
+        success: true,
+        data: attachments,
     });
 }));
 
 /**
  * @route DELETE /api/v1/attachments/:attachmentId
  * @desc Delete an attachment
- * @access Private (editor+ for own uploads, admin+ for any)
+ * @access Private (Editor+)
  */
-router.delete('/:attachmentId', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+router.delete('/:attachmentId', authenticate, requireTenant, requireMinRole(Role.EDITOR), asyncHandler(async (req: Request, res: Response) => {
     const { attachmentId } = req.params;
     const tenantId = req.tenantId!;
     const userId = req.user!.id;
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
+    // Get attachment and verify tenant access
+    const result = await pool.request()
+        .input('attachment_id', attachmentId)
+        .query(`
+            SELECT a.*, n.tenant_id
+            FROM attachments a
+            INNER JOIN notes n ON a.note_id = n.id
+            WHERE a.id = @attachment_id AND a.is_deleted = 0
+        `);
+
+    if (result.recordset.length === 0) {
+        throw new NotFoundError('Attachment not found');
     }
 
-    const attachment = attachments.get(attachmentId);
-    if (!attachment || attachment.tenantId !== tenantId) {
-        throw new NotFoundError('Attachment', attachmentId);
+    const attachment = result.recordset[0];
+
+    if (attachment.tenant_id !== tenantId) {
+        throw new NotFoundError('Attachment not found');
     }
 
-    const isUploader = attachment.uploadedBy === userId;
-    const isAdmin = access.role === Role.OWNER || access.role === Role.ADMIN;
-    const canEdit = access.role !== Role.VIEWER;
-
-    if (!canEdit) {
-        throw new ForbiddenError('Viewers cannot delete attachments');
+    // Delete from Azure Blob Storage
+    if (blobServiceClient) {
+        try {
+            const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
+            const blockBlobClient = containerClient.getBlockBlobClient(attachment.blob_name);
+            await blockBlobClient.delete();
+        } catch (error) {
+            logger.error('Failed to delete blob', {
+                error,
+                blobName: attachment.blob_name,
+                attachmentId
+            });
+            // Continue with soft delete even if blob deletion fails
+        }
     }
 
-    if (!isUploader && !isAdmin) {
-        throw new ForbiddenError('You can only delete attachments you uploaded');
-    }
+    // Soft delete in database
+    await pool.request()
+        .input('attachment_id', attachmentId)
+        .input('deleted_by', userId)
+        .query(`
+            UPDATE attachments
+            SET is_deleted = 1, deleted_by = @deleted_by, deleted_at = GETUTCDATE()
+            WHERE id = @attachment_id
+        `);
 
-    // Soft delete
-    attachment.isDeleted = true;
-    attachment.updatedAt = new Date();
-
-    // In production, also delete from Azure Blob Storage (or mark for cleanup)
-    // await deleteFromAzureBlob(attachment.blobUrl);
+    logger.info('Attachment deleted', { attachmentId, tenantId, userId });
 
     res.json({
         success: true,

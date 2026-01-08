@@ -1,307 +1,326 @@
 import { Router, Request, Response } from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
+import { pool } from '../config/database';
 import {
     authenticate,
-    asyncHandler,
     requireTenant,
+    requireMinRole,
+    requireAdmin,
+    asyncHandler,
     ValidationError,
     NotFoundError,
-    ForbiddenError
+    ForbiddenError,
 } from '../middleware';
-import { Role, RoleHierarchy, TenantMember, InvitationStatus, Invitation } from '../types';
-import { tenants, tenantMembers } from './tenants';
+import { Role } from '../types';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
-// In-memory invitation store
-const invitations = new Map<string, Invitation>();
-
 /**
  * @route GET /api/v1/members
- * @desc Get all members of current tenant
- * @access Private (viewer+)
+ * @desc Get all members of a tenant
+ * @access Private (Viewer+)
  */
 router.get('/', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
     const tenantId = req.tenantId!;
-    const userId = req.user!.id;
 
-    // Verify user is a member
-    const userMembership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
+    const result = await pool.request()
+        .input('tenant_id', tenantId)
+        .query(`
+            SELECT 
+                tm.id, tm.tenant_id, tm.user_id, tm.role, tm.joined_at, tm.is_suspended,
+                u.name, u.email, u.avatar_url
+            FROM tenant_members tm
+            INNER JOIN users u ON tm.user_id = u.id
+            WHERE tm.tenant_id = @tenant_id
+            ORDER BY tm.role DESC, tm.joined_at ASC
+        `);
 
-    if (!userMembership) {
-        throw new ForbiddenError('You are not a member of this tenant');
-    }
-
-    // Get all members
-    const members = Array.from(tenantMembers.values())
-        .filter(m => m.tenantId === tenantId)
-        .map(m => ({
-            id: m.id,
-            userId: m.userId,
-            role: m.role,
-            joinedAt: m.joinedAt,
-            isSuspended: m.isSuspended,
-            // TODO: Join with user data from database
-        }));
+    const members = result.recordset.map(row => ({
+        id: row.id,
+        tenantId: row.tenant_id,
+        userId: row.user_id,
+        name: row.name,
+        email: row.email,
+        avatarUrl: row.avatar_url,
+        role: row.role,
+        joinedAt: row.joined_at,
+        isSuspended: row.is_suspended,
+    }));
 
     res.json({
         success: true,
         data: members,
-        meta: {
-            total: members.length,
-        },
     });
 }));
 
 /**
  * @route POST /api/v1/members/invite
- * @desc Invite a new member to tenant
- * @access Private (admin+)
+ * @desc Invite a user to the tenant
+ * @access Private (Admin+)
  */
-router.post('/invite', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
-    const { email, role = Role.VIEWER } = req.body;
+router.post('/invite', authenticate, requireTenant, requireMinRole(Role.ADMIN), asyncHandler(async (req: Request, res: Response) => {
+    const { email, role } = req.body;
     const tenantId = req.tenantId!;
-    const userId = req.user!.id;
+    const inviterId = req.user!.id;
 
-    if (!email) {
-        throw new ValidationError('Email is required');
+    if (!email || !role) {
+        throw new ValidationError('Email and role are required');
     }
 
     // Validate role
-    if (![Role.ADMIN, Role.EDITOR, Role.VIEWER].includes(role)) {
-        throw new ValidationError('Invalid role. Cannot invite as owner.');
+    const validRoles = [Role.VIEWER, Role.EDITOR, Role.ADMIN];
+    if (!validRoles.includes(role)) {
+        throw new ValidationError('Invalid role. Must be VIEWER, EDITOR, or ADMIN');
     }
 
-    // Check if inviter has permission
-    const inviterMembership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
+    // Check if user exists
+    const userResult = await pool.request()
+        .input('email', email.toLowerCase())
+        .query('SELECT id FROM users WHERE email = @email');
 
-    if (!inviterMembership) {
-        throw new ForbiddenError('You are not a member of this tenant');
+    let inviteeId: string | null = null;
+    if (userResult.recordset.length > 0) {
+        inviteeId = userResult.recordset[0].id;
+
+        // Check if already a member
+        const memberCheck = await pool.request()
+            .input('tenant_id', tenantId)
+            .input('user_id', inviteeId)
+            .query('SELECT id FROM tenant_members WHERE tenant_id = @tenant_id AND user_id = @user_id');
+
+        if (memberCheck.recordset.length > 0) {
+            throw new ValidationError('User is already a member of this tenant');
+        }
     }
 
-    // Must be admin or owner to invite
-    if (inviterMembership.role !== Role.OWNER && inviterMembership.role !== Role.ADMIN) {
-        throw new ForbiddenError('Only admins and owners can invite members');
-    }
+    // Generate invitation token
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days
 
-    // Check if already a pending invitation
-    const existingInvite = Array.from(invitations.values())
-        .find(i => i.tenantId === tenantId && i.email === email.toLowerCase() && i.status === InvitationStatus.PENDING);
+    const result = await pool.request()
+        .input('tenant_id', tenantId)
+        .input('email', email.toLowerCase())
+        .input('role', role)
+        .input('token', token)
+        .input('invited_by', inviterId)
+        .input('invitee_id', inviteeId)
+        .input('expires_at', expiresAt)
+        .query(`
+            INSERT INTO invitations (id, tenant_id, email, role, token, invited_by, invitee_id, expires_at, created_at)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @tenant_id, @email, @role, @token, @invited_by, @invitee_id, @expires_at, GETUTCDATE())
+        `);
 
-    if (existingInvite) {
-        throw new ValidationError('An invitation for this email is already pending');
-    }
+    const invitation = result.recordset[0];
 
-    // Create invitation
-    const invitation: Invitation = {
-        id: uuidv4(),
-        tenantId,
-        email: email.toLowerCase(),
-        role,
-        status: InvitationStatus.PENDING,
-        invitedBy: userId,
-        token: uuidv4(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-        createdAt: new Date(),
-        updatedAt: new Date(),
-    };
-
-    invitations.set(invitation.id, invitation);
+    logger.info('Invitation created', { tenantId, email, role, inviterId });
 
     // TODO: Send invitation email
+    logger.info('Invitation token (implement email sending)', {
+        invitationId: invitation.id,
+        token: invitation.token
+    });
 
     res.status(201).json({
         success: true,
         data: {
-            invitationId: invitation.id,
+            id: invitation.id,
+            tenantId: invitation.tenant_id,
             email: invitation.email,
             role: invitation.role,
-            expiresAt: invitation.expiresAt,
-            inviteLink: `/invite/${invitation.token}`,
+            status: invitation.status,
+            expiresAt: invitation.expires_at,
+            invitationLink: `${process.env.FRONTEND_URL}/invite/${token}`,
         },
+        message: 'Invitation sent successfully',
     });
 }));
 
 /**
- * @route POST /api/v1/members/invitations/:token/accept
+ * @route POST /api/v1/members/invite/:token/accept
  * @desc Accept an invitation
  * @access Private
  */
-router.post('/invitations/:token/accept', authenticate, asyncHandler(async (req: Request, res: Response) => {
+router.post('/invite/:token/accept', authenticate, asyncHandler(async (req: Request, res: Response) => {
     const { token } = req.params;
     const userId = req.user!.id;
 
-    const invitation = Array.from(invitations.values())
-        .find(i => i.token === token);
+    // Find valid invitation
+    const invitationResult = await pool.request()
+        .input('token', token)
+        .query(`
+            SELECT * FROM invitations
+            WHERE token = @token 
+            AND status = 'pending'
+            AND expires_at > GETUTCDATE()
+        `);
 
-    if (!invitation) {
-        throw new NotFoundError('Invitation');
+    if (invitationResult.recordset.length === 0) {
+        throw new NotFoundError('Invalid or expired invitation');
     }
 
-    if (invitation.status !== InvitationStatus.PENDING) {
-        throw new ValidationError(`Invitation has already been ${invitation.status}`);
-    }
+    const invitation = invitationResult.recordset[0];
 
-    if (new Date() > invitation.expiresAt) {
-        invitation.status = InvitationStatus.EXPIRED;
-        throw new ValidationError('Invitation has expired');
-    }
+    // Verify email matches (if user exists)
+    const userResult = await pool.request()
+        .input('user_id', userId)
+        .query('SELECT email FROM users WHERE id = @user_id');
 
-    // Check if user email matches invitation email
-    if (req.user!.email.toLowerCase() !== invitation.email) {
-        throw new ForbiddenError('This invitation was sent to a different email address');
+    if (userResult.recordset[0].email.toLowerCase() !== invitation.email.toLowerCase()) {
+        throw new ForbiddenError('This invitation is for a different email address');
     }
 
     // Check if already a member
-    const existingMembership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === invitation.tenantId && m.userId === userId);
+    const memberCheck = await pool.request()
+        .input('tenant_id', invitation.tenant_id)
+        .input('user_id', userId)
+        .query('SELECT id FROM tenant_members WHERE tenant_id = @tenant_id AND user_id = @user_id');
 
-    if (existingMembership) {
+    if (memberCheck.recordset.length > 0) {
         throw new ValidationError('You are already a member of this tenant');
     }
 
-    // Create membership
-    const membership: TenantMember = {
-        id: uuidv4(),
-        tenantId: invitation.tenantId,
-        userId,
-        role: invitation.role,
-        joinedAt: new Date(),
-        invitedBy: invitation.invitedBy,
-        isSuspended: false,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-    };
-
-    tenantMembers.set(membership.id, membership);
+    // Add member
+    const memberResult = await pool.request()
+        .input('tenant_id', invitation.tenant_id)
+        .input('user_id', userId)
+        .input('role', invitation.role)
+        .input('invited_by', invitation.invited_by)
+        .query(`
+            INSERT INTO tenant_members (id, tenant_id, user_id, role, joined_at, invited_by, is_suspended, created_at, updated_at)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @tenant_id, @user_id, @role, GETUTCDATE(), @invited_by, 0, GETUTCDATE(), GETUTCDATE())
+        `);
 
     // Update invitation status
-    invitation.status = InvitationStatus.ACCEPTED;
-    invitation.updatedAt = new Date();
+    await pool.request()
+        .input('invitation_id', invitation.id)
+        .input('accepted_at', new Date())
+        .query(`
+            UPDATE invitations
+            SET status = 'accepted', accepted_at = @accepted_at
+            WHERE id = @invitation_id
+        `);
+
+    const membership = memberResult.recordset[0];
+
+    logger.info('Invitation accepted', { tenantId: invitation.tenant_id, userId });
 
     res.json({
         success: true,
         data: {
-            message: 'Invitation accepted successfully',
-            tenant: tenants.get(invitation.tenantId),
+            tenantId: membership.tenant_id,
             role: membership.role,
+            joinedAt: membership.joined_at,
         },
+        message: 'Successfully joined the team',
     });
 }));
 
 /**
- * @route PUT /api/v1/members/:memberId/role
+ * @route PUT /api/v1/members/:memberId
  * @desc Update member role
- * @access Private (admin+)
+ * @access Private (Admin+)
  */
-router.put('/:memberId/role', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+router.put('/:memberId', authenticate, requireTenant, requireMinRole(Role.ADMIN), asyncHandler(async (req: Request, res: Response) => {
     const { memberId } = req.params;
     const { role } = req.body;
     const tenantId = req.tenantId!;
-    const userId = req.user!.id;
+    const requesterId = req.user!.id;
 
-    if (!role || !Object.values(Role).includes(role)) {
-        throw new ValidationError('Valid role is required');
+    if (!role) {
+        throw new ValidationError('Role is required');
     }
 
-    // Get the member to update
-    const targetMember = tenantMembers.get(memberId);
-    if (!targetMember || targetMember.tenantId !== tenantId) {
-        throw new NotFoundError('Member', memberId);
+    // Validate role
+    const validRoles = [Role.VIEWER, Role.EDITOR, Role.ADMIN];
+    if (!validRoles.includes(role)) {
+        throw new ValidationError('Invalid role');
     }
 
-    // Get current user's membership
-    const currentMembership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
+    // Get member details
+    const memberResult = await pool.request()
+        .input('member_id', memberId)
+        .input('tenant_id', tenantId)
+        .query('SELECT * FROM tenant_members WHERE id = @member_id AND tenant_id = @tenant_id');
 
-    if (!currentMembership) {
-        throw new ForbiddenError('You are not a member of this tenant');
+    if (memberResult.recordset.length === 0) {
+        throw new NotFoundError('Member not found');
     }
 
-    // Permission checks
-    const currentLevel = RoleHierarchy[currentMembership.role];
-    const targetLevel = RoleHierarchy[targetMember.role];
-    const newLevel = RoleHierarchy[role as Role];
+    const member = memberResult.recordset[0];
 
     // Cannot change owner role
-    if (targetMember.role === Role.OWNER) {
-        throw new ForbiddenError('Cannot change the role of an owner');
+    if (member.role === Role.OWNER) {
+        throw new ForbiddenError('Cannot change owner role');
     }
 
-    // Cannot promote to owner
-    if (role === Role.OWNER) {
-        throw new ForbiddenError('Cannot promote to owner. Use ownership transfer instead.');
+    // Cannot change your own role
+    if (member.user_id === requesterId) {
+        throw new ForbiddenError('Cannot change your own role');
     }
 
-    // Must have higher role than target
-    if (currentLevel <= targetLevel) {
-        throw new ForbiddenError('Cannot modify role of someone with equal or higher role');
-    }
+    await pool.request()
+        .input('member_id', memberId)
+        .input('role', role)
+        .query(`
+            UPDATE tenant_members
+            SET role = @role, updated_at = GETUTCDATE()
+            WHERE id = @member_id
+        `);
 
-    // Cannot promote above own role
-    if (newLevel >= currentLevel && currentMembership.role !== Role.OWNER) {
-        throw new ForbiddenError('Cannot promote member to a role equal or higher than your own');
-    }
-
-    // Update role
-    targetMember.role = role;
-    targetMember.updatedAt = new Date();
+    logger.info('Member role updated', { tenantId, memberId, newRole: role, requesterId });
 
     res.json({
         success: true,
-        data: targetMember,
+        data: {
+            id: member.id,
+            userId: member.user_id,
+            role: role,
+            message: 'Member role updated successfully',
+        },
     });
 }));
 
 /**
  * @route DELETE /api/v1/members/:memberId
- * @desc Remove member from tenant
- * @access Private (admin+) or self
+ * @desc Remove a member from tenant
+ * @access Private (Admin+)
  */
-router.delete('/:memberId', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+router.delete('/:memberId', authenticate, requireTenant, requireMinRole(Role.ADMIN), asyncHandler(async (req: Request, res: Response) => {
     const { memberId } = req.params;
     const tenantId = req.tenantId!;
-    const userId = req.user!.id;
+    const requesterId = req.user!.id;
 
-    const targetMember = tenantMembers.get(memberId);
-    if (!targetMember || targetMember.tenantId !== tenantId) {
-        throw new NotFoundError('Member', memberId);
+    // Get member details
+    const memberResult = await pool.request()
+        .input('member_id', memberId)
+        .input('tenant_id', tenantId)
+        .query('SELECT * FROM tenant_members WHERE id = @member_id AND tenant_id = @tenant_id');
+
+    if (memberResult.recordset.length === 0) {
+        throw new NotFoundError('Member not found');
     }
+
+    const member = memberResult.recordset[0];
 
     // Cannot remove owner
-    if (targetMember.role === Role.OWNER) {
-        throw new ForbiddenError('Cannot remove the owner. Transfer ownership first.');
+    if (member.role === Role.OWNER) {
+        throw new ForbiddenError('Cannot remove owner');
     }
 
-    const currentMembership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
-
-    if (!currentMembership) {
-        throw new ForbiddenError('You are not a member of this tenant');
+    // Cannot remove yourself
+    if (member.user_id === requesterId) {
+        throw new ForbiddenError('Cannot remove yourself. Use leave endpoint instead');
     }
 
-    // Allow self-removal or admin+ removal
-    const isSelf = targetMember.userId === userId;
-    const isAdmin = currentMembership.role === Role.OWNER || currentMembership.role === Role.ADMIN;
+    await pool.request()
+        .input('member_id', memberId)
+        .query('DELETE FROM tenant_members WHERE id = @member_id');
 
-    if (!isSelf && !isAdmin) {
-        throw new ForbiddenError('You do not have permission to remove this member');
-    }
-
-    // Check role hierarchy for admins
-    if (!isSelf) {
-        const currentLevel = RoleHierarchy[currentMembership.role];
-        const targetLevel = RoleHierarchy[targetMember.role];
-
-        if (currentLevel <= targetLevel) {
-            throw new ForbiddenError('Cannot remove someone with equal or higher role');
-        }
-    }
-
-    // Remove member
-    tenantMembers.delete(memberId);
+    logger.info('Member removed', { tenantId, memberId, requesterId });
 
     res.json({
         success: true,
@@ -312,47 +331,42 @@ router.delete('/:memberId', authenticate, requireTenant, asyncHandler(async (req
 }));
 
 /**
- * @route PUT /api/v1/members/:memberId/suspend
- * @desc Suspend a member
- * @access Private (admin+)
+ * @route POST /api/v1/members/leave
+ * @desc Leave a tenant
+ * @access Private
  */
-router.put('/:memberId/suspend', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
-    const { memberId } = req.params;
+router.post('/leave', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
     const tenantId = req.tenantId!;
     const userId = req.user!.id;
 
-    const targetMember = tenantMembers.get(memberId);
-    if (!targetMember || targetMember.tenantId !== tenantId) {
-        throw new NotFoundError('Member', memberId);
+    // Get membership
+    const memberResult = await pool.request()
+        .input('tenant_id', tenantId)
+        .input('user_id', userId)
+        .query('SELECT * FROM tenant_members WHERE tenant_id = @tenant_id AND user_id = @user_id');
+
+    if (memberResult.recordset.length === 0) {
+        throw new NotFoundError('Membership not found');
     }
 
-    // Cannot suspend owner or self
-    if (targetMember.role === Role.OWNER) {
-        throw new ForbiddenError('Cannot suspend the owner');
+    const member = memberResult.recordset[0];
+
+    // Cannot leave if owner
+    if (member.role === Role.OWNER) {
+        throw new ForbiddenError('Owner cannot leave. Transfer ownership or delete the tenant instead');
     }
 
-    if (targetMember.userId === userId) {
-        throw new ForbiddenError('Cannot suspend yourself');
-    }
+    await pool.request()
+        .input('member_id', member.id)
+        .query('DELETE FROM tenant_members WHERE id = @member_id');
 
-    const currentMembership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
-
-    if (!currentMembership || (currentMembership.role !== Role.OWNER && currentMembership.role !== Role.ADMIN)) {
-        throw new ForbiddenError('Admin access required');
-    }
-
-    // Check role hierarchy
-    if (RoleHierarchy[currentMembership.role] <= RoleHierarchy[targetMember.role]) {
-        throw new ForbiddenError('Cannot suspend someone with equal or higher role');
-    }
-
-    targetMember.isSuspended = true;
-    targetMember.updatedAt = new Date();
+    logger.info('Member left tenant', { tenantId, userId });
 
     res.json({
         success: true,
-        data: targetMember,
+        data: {
+            message: 'Successfully left the team',
+        },
     });
 }));
 

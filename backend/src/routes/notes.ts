@@ -1,362 +1,308 @@
 import { Router, Request, Response } from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import { pool } from '../config/database';
 import {
     authenticate,
-    asyncHandler,
     requireTenant,
-    requireEditor,
-    requirePermission,
+    requireMinRole,
+    asyncHandler,
     ValidationError,
     NotFoundError,
-    ForbiddenError
 } from '../middleware';
-import { Note, Role, Permission } from '../types';
-import { tenantMembers } from './tenants';
+import { Role } from '../types';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
-// In-memory notes store
-const notes = new Map<string, Note>();
-
 /**
- * Helper: Check if user has access to tenant
+ * @route POST /api/v1/notes
+ * @desc Create a new note
+ * @access Private (Editor+)
  */
-const checkTenantAccess = (tenantId: string, userId: string): { role: Role } | null => {
-    const membership = Array.from(tenantMembers.values())
-        .find(m => m.tenantId === tenantId && m.userId === userId && !m.isSuspended);
-    return membership ? { role: membership.role } : null;
-};
-
-/**
- * @route GET /api/v1/notes
- * @desc Get all notes for current tenant
- * @access Private (viewer+)
- */
-router.get('/', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+router.post('/', authenticate, requireTenant, requireMinRole(Role.EDITOR), asyncHandler(async (req: Request, res: Response) => {
+    const { title, content, tags } = req.body;
     const tenantId = req.tenantId!;
     const userId = req.user!.id;
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
+    if (!title || title.trim().length === 0) {
+        throw new ValidationError('Title is required');
     }
 
-    // Query params
-    const {
-        search,
-        sortBy = 'updatedAt',
-        sortOrder = 'desc',
-        page = 1,
-        limit = 20,
-        includeDeleted = false
-    } = req.query;
+    const result = await pool.request()
+        .input('tenant_id', tenantId)
+        .input('title', title.trim())
+        .input('content', content || '')
+        .input('tags', tags ? JSON.stringify(tags) : null)
+        .input('created_by', userId)
+        .query(`
+            INSERT INTO notes (id, tenant_id, title, content, tags, created_by, created_at, updated_at, is_deleted)
+            OUTPUT INSERTED.*
+            VALUES (NEWID(), @tenant_id, @title, @content, @tags, @created_by, GETUTCDATE(), GETUTCDATE(), 0)
+        `);
 
-    // Filter notes
-    let filteredNotes = Array.from(notes.values())
-        .filter(n => n.tenantId === tenantId);
+    const note = result.recordset[0];
 
-    // Exclude deleted unless requested
-    if (!includeDeleted) {
-        filteredNotes = filteredNotes.filter(n => !n.isDeleted);
-    }
+    logger.info('Note created', { noteId: note.id, tenantId, userId });
 
-    // Search
-    if (search && typeof search === 'string') {
-        const searchLower = search.toLowerCase();
-        filteredNotes = filteredNotes.filter(n =>
-            n.title.toLowerCase().includes(searchLower) ||
-            n.content.toLowerCase().includes(searchLower)
-        );
-    }
-
-    // Sort
-    filteredNotes.sort((a, b) => {
-        const aVal = a[sortBy as keyof Note];
-        const bVal = b[sortBy as keyof Note];
-        const order = sortOrder === 'asc' ? 1 : -1;
-
-        if (aVal instanceof Date && bVal instanceof Date) {
-            return (aVal.getTime() - bVal.getTime()) * order;
-        }
-        if (typeof aVal === 'string' && typeof bVal === 'string') {
-            return aVal.localeCompare(bVal) * order;
-        }
-        return 0;
+    res.status(201).json({
+        success: true,
+        data: {
+            id: note.id,
+            tenantId: note.tenant_id,
+            title: note.title,
+            content: note.content,
+            tags: note.tags ? JSON.parse(note.tags) : [],
+            createdBy: note.created_by,
+            createdAt: note.created_at,
+            updatedAt: note.updated_at,
+        },
     });
+}));
 
-    // Pagination
+/**
+ * @route GET /api/v1/notes
+ * @desc Get all notes for tenant
+ * @access Private (Viewer+)
+ */
+router.get('/', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+    const tenantId = req.tenantId!;
+    const { search, tags, page = '1', limit = '20' } = req.query;
+
     const pageNum = parseInt(page as string, 10);
-    const limitNum = Math.min(parseInt(limit as string, 10), 100);
-    const startIndex = (pageNum - 1) * limitNum;
-    const paginatedNotes = filteredNotes.slice(startIndex, startIndex + limitNum);
+    const limitNum = parseInt(limit as string, 10);
+    const offset = (pageNum - 1) * limitNum;
+
+    let whereClause = 'WHERE n.tenant_id = @tenant_id AND n.is_deleted = 0';
+    const request = pool.request()
+        .input('tenant_id', tenantId)
+        .input('limit', limitNum)
+        .input('offset', offset);
+
+    if (search) {
+        whereClause += ' AND (n.title LIKE @search OR n.content LIKE @search)';
+        request.input('search', `%${search}%`);
+    }
+
+    if (tags) {
+        const tagArray = (tags as string).split(',');
+        whereClause += ' AND n.tags LIKE @tag_search';
+        request.input('tag_search', `%${tagArray[0]}%`); // Simple tag search
+    }
+
+    const result = await request.query(`
+        SELECT 
+            n.id, n.tenant_id, n.title, n.content, n.tags, n.created_by, n.updated_by,
+            n.created_at, n.updated_at,
+            u.name as creator_name
+        FROM notes n
+        LEFT JOIN users u ON n.created_by = u.id
+        ${whereClause}
+        ORDER BY n.updated_at DESC
+        OFFSET @offset ROWS
+        FETCH NEXT @limit ROWS ONLY
+    `);
+
+    const countResult = await pool.request()
+        .input('tenant_id', tenantId)
+        .query(`
+            SELECT COUNT(*) as total
+            FROM notes
+            WHERE tenant_id = @tenant_id AND is_deleted = 0
+        `);
+
+    const notes = result.recordset.map(row => ({
+        id: row.id,
+        tenantId: row.tenant_id,
+        title: row.title,
+        content: row.content,
+        tags: row.tags ? JSON.parse(row.tags) : [],
+        createdBy: row.created_by,
+        creatorName: row.creator_name,
+        updatedBy: row.updated_by,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+    }));
 
     res.json({
         success: true,
-        data: paginatedNotes,
-        meta: {
+        data: notes,
+        pagination: {
             page: pageNum,
             limit: limitNum,
-            total: filteredNotes.length,
-            totalPages: Math.ceil(filteredNotes.length / limitNum),
+            total: countResult.recordset[0].total,
+            totalPages: Math.ceil(countResult.recordset[0].total / limitNum),
         },
     });
 }));
 
 /**
  * @route GET /api/v1/notes/:noteId
- * @desc Get note details
- * @access Private (viewer+)
+ * @desc Get a single note
+ * @access Private (Viewer+)
  */
 router.get('/:noteId', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
     const { noteId } = req.params;
     const tenantId = req.tenantId!;
-    const userId = req.user!.id;
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
+    const result = await pool.request()
+        .input('note_id', noteId)
+        .input('tenant_id', tenantId)
+        .query(`
+            SELECT 
+                n.id, n.tenant_id, n.title, n.content, n.tags, n.created_by, n.updated_by,
+                n.created_at, n.updated_at,
+                u1.name as creator_name,
+                u2.name as updater_name
+            FROM notes n
+            LEFT JOIN users u1 ON n.created_by = u1.id
+            LEFT JOIN users u2 ON n.updated_by = u2.id
+            WHERE n.id = @note_id AND n.tenant_id = @tenant_id AND n.is_deleted = 0
+        `);
+
+    if (result.recordset.length === 0) {
+        throw new NotFoundError('Note not found');
     }
 
-    const note = notes.get(noteId);
-    if (!note || note.tenantId !== tenantId) {
-        throw new NotFoundError('Note', noteId);
-    }
-
-    if (note.isDeleted) {
-        throw new NotFoundError('Note', noteId);
-    }
+    const note = result.recordset[0];
 
     res.json({
         success: true,
-        data: note,
-    });
-}));
-
-/**
- * @route POST /api/v1/notes
- * @desc Create a new note
- * @access Private (editor+)
- */
-router.post('/', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
-    const { title, content = '' } = req.body;
-    const tenantId = req.tenantId!;
-    const userId = req.user!.id;
-
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
-    }
-
-    // Check permission
-    if (access.role === Role.VIEWER) {
-        throw new ForbiddenError('Viewers cannot create notes');
-    }
-
-    if (!title || title.trim().length === 0) {
-        throw new ValidationError('Note title is required');
-    }
-
-    if (title.length > 500) {
-        throw new ValidationError('Title cannot exceed 500 characters');
-    }
-
-    const note: Note = {
-        id: uuidv4(),
-        tenantId,
-        title: title.trim(),
-        content,
-        createdBy: userId,
-        lastModifiedBy: userId,
-        isDeleted: false,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-    };
-
-    notes.set(note.id, note);
-
-    res.status(201).json({
-        success: true,
-        data: note,
+        data: {
+            id: note.id,
+            tenantId: note.tenant_id,
+            title: note.title,
+            content: note.content,
+            tags: note.tags ? JSON.parse(note.tags) : [],
+            createdBy: note.created_by,
+            creatorName: note.creator_name,
+            updatedBy: note.updated_by,
+            updaterName: note.updater_name,
+            createdAt: note.created_at,
+            updatedAt: note.updated_at,
+        },
     });
 }));
 
 /**
  * @route PUT /api/v1/notes/:noteId
  * @desc Update a note
- * @access Private (editor+)
+ * @access Private (Editor+)
  */
-router.put('/:noteId', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+router.put('/:noteId', authenticate, requireTenant, requireMinRole(Role.EDITOR), asyncHandler(async (req: Request, res: Response) => {
     const { noteId } = req.params;
-    const { title, content } = req.body;
+    const { title, content, tags } = req.body;
     const tenantId = req.tenantId!;
     const userId = req.user!.id;
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
+    // Verify note exists and belongs to tenant
+    const noteCheck = await pool.request()
+        .input('note_id', noteId)
+        .input('tenant_id', tenantId)
+        .query('SELECT id FROM notes WHERE id = @note_id AND tenant_id = @tenant_id AND is_deleted = 0');
+
+    if (noteCheck.recordset.length === 0) {
+        throw new NotFoundError('Note not found');
     }
 
-    if (access.role === Role.VIEWER) {
-        throw new ForbiddenError('Viewers cannot edit notes');
-    }
+    const updates: string[] = [];
+    const request = pool.request()
+        .input('note_id', noteId)
+        .input('tenant_id', tenantId)
+        .input('updated_by', userId);
 
-    const note = notes.get(noteId);
-    if (!note || note.tenantId !== tenantId || note.isDeleted) {
-        throw new NotFoundError('Note', noteId);
-    }
-
-    // Update fields
     if (title !== undefined) {
         if (title.trim().length === 0) {
-            throw new ValidationError('Note title cannot be empty');
+            throw new ValidationError('Title cannot be empty');
         }
-        if (title.length > 500) {
-            throw new ValidationError('Title cannot exceed 500 characters');
-        }
-        note.title = title.trim();
+        updates.push('title = @title');
+        request.input('title', title.trim());
     }
 
     if (content !== undefined) {
-        note.content = content;
+        updates.push('content = @content');
+        request.input('content', content);
     }
 
-    note.lastModifiedBy = userId;
-    note.updatedAt = new Date();
-
-    res.json({
-        success: true,
-        data: note,
-    });
-}));
-
-/**
- * @route PATCH /api/v1/notes/:noteId/content
- * @desc Auto-save note content
- * @access Private (editor+)
- */
-router.patch('/:noteId/content', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
-    const { noteId } = req.params;
-    const { content } = req.body;
-    const tenantId = req.tenantId!;
-    const userId = req.user!.id;
-
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access || access.role === Role.VIEWER) {
-        throw new ForbiddenError('Cannot edit notes');
+    if (tags !== undefined) {
+        updates.push('tags = @tags');
+        request.input('tags', tags ? JSON.stringify(tags) : null);
     }
 
-    const note = notes.get(noteId);
-    if (!note || note.tenantId !== tenantId || note.isDeleted) {
-        throw new NotFoundError('Note', noteId);
+    if (updates.length === 0) {
+        throw new ValidationError('No valid fields to update');
     }
 
-    note.content = content;
-    note.lastModifiedBy = userId;
-    note.updatedAt = new Date();
+    updates.push('updated_by = @updated_by');
+    updates.push('updated_at = GETUTCDATE()');
+
+    await request.query(`
+        UPDATE notes
+        SET ${updates.join(', ')}
+        WHERE id = @note_id AND tenant_id = @tenant_id
+    `);
+
+    const result = await pool.request()
+        .input('note_id', noteId)
+        .query('SELECT * FROM notes WHERE id = @note_id');
+
+    const note = result.recordset[0];
+
+    logger.info('Note updated', { noteId, tenantId, userId });
 
     res.json({
         success: true,
         data: {
             id: note.id,
-            updatedAt: note.updatedAt,
+            tenantId: note.tenant_id,
+            title: note.title,
+            content: note.content,
+            tags: note.tags ? JSON.parse(note.tags) : [],
+            createdBy: note.created_by,
+            updatedBy: note.updated_by,
+            createdAt: note.created_at,
+            updatedAt: note.updated_at,
         },
     });
 }));
 
 /**
  * @route DELETE /api/v1/notes/:noteId
- * @desc Delete a note (soft delete)
- * @access Private (editor+ for own notes, admin+ for any)
+ * @desc Soft delete a note
+ * @access Private (Editor+)
  */
-router.delete('/:noteId', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
-    const { noteId } = req.params;
-    const { permanent = false } = req.query;
-    const tenantId = req.tenantId!;
-    const userId = req.user!.id;
-
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access) {
-        throw new ForbiddenError('You do not have access to this tenant');
-    }
-
-    const note = notes.get(noteId);
-    if (!note || note.tenantId !== tenantId) {
-        throw new NotFoundError('Note', noteId);
-    }
-
-    // Permission check
-    const isOwner = note.createdBy === userId;
-    const isAdmin = access.role === Role.OWNER || access.role === Role.ADMIN;
-    const canEdit = access.role !== Role.VIEWER;
-
-    if (!canEdit) {
-        throw new ForbiddenError('Viewers cannot delete notes');
-    }
-
-    if (!isOwner && !isAdmin) {
-        throw new ForbiddenError('You can only delete notes you created');
-    }
-
-    if (permanent && isAdmin) {
-        // Permanent delete
-        notes.delete(noteId);
-        res.json({
-            success: true,
-            data: {
-                message: 'Note permanently deleted',
-            },
-        });
-    } else {
-        // Soft delete
-        note.isDeleted = true;
-        note.deletedAt = new Date();
-        note.deletedBy = userId;
-        note.updatedAt = new Date();
-
-        res.json({
-            success: true,
-            data: {
-                message: 'Note deleted',
-            },
-        });
-    }
-}));
-
-/**
- * @route POST /api/v1/notes/:noteId/restore
- * @desc Restore a soft-deleted note
- * @access Private (admin+)
- */
-router.post('/:noteId/restore', authenticate, requireTenant, asyncHandler(async (req: Request, res: Response) => {
+router.delete('/:noteId', authenticate, requireTenant, requireMinRole(Role.EDITOR), asyncHandler(async (req: Request, res: Response) => {
     const { noteId } = req.params;
     const tenantId = req.tenantId!;
     const userId = req.user!.id;
 
-    const access = checkTenantAccess(tenantId, userId);
-    if (!access || (access.role !== Role.OWNER && access.role !== Role.ADMIN)) {
-        throw new ForbiddenError('Admin access required to restore notes');
+    // Verify note exists
+    const noteCheck = await pool.request()
+        .input('note_id', noteId)
+        .input('tenant_id', tenantId)
+        .query('SELECT id FROM notes WHERE id = @note_id AND tenant_id = @tenant_id AND is_deleted = 0');
+
+    if (noteCheck.recordset.length === 0) {
+        throw new NotFoundError('Note not found');
     }
 
-    const note = notes.get(noteId);
-    if (!note || note.tenantId !== tenantId) {
-        throw new NotFoundError('Note', noteId);
-    }
+    // Soft delete
+    await pool.request()
+        .input('note_id', noteId)
+        .input('tenant_id', tenantId)
+        .input('deleted_by', userId)
+        .query(`
+            UPDATE notes
+            SET is_deleted = 1, deleted_by = @deleted_by, deleted_at = GETUTCDATE()
+            WHERE id = @note_id AND tenant_id = @tenant_id
+        `);
 
-    if (!note.isDeleted) {
-        throw new ValidationError('Note is not deleted');
-    }
-
-    note.isDeleted = false;
-    note.deletedAt = undefined;
-    note.deletedBy = undefined;
-    note.updatedAt = new Date();
+    logger.info('Note deleted', { noteId, tenantId, userId });
 
     res.json({
         success: true,
-        data: note,
+        data: {
+            message: 'Note deleted successfully',
+        },
     });
 }));
 
-// Export for attachments
-export { notes };
 export default router;
