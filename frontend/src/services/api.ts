@@ -18,7 +18,7 @@ interface ApiResponse<T = unknown> {
     };
 }
 // API Configuration
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api/v1';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://saas-learning-api-mohit.azurewebsites.net/api/v1';
 
 // Create axios instance
 const api = axios.create({

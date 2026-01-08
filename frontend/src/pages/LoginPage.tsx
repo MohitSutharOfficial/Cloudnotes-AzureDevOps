@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Building2, Mail, Lock, Eye, EyeOff } from 'lucide-react';
+import { Building2, Eye, EyeOff } from 'lucide-react';
 import { Button, Input } from '../components/common';
 import { useAuthStore, toast } from '../stores';
 

@@ -6,7 +6,6 @@ import {
     Shield,
     Ban,
     Trash2,
-    Mail,
     Crown,
     UserCog
 } from 'lucide-react';

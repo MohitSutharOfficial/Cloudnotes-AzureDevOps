@@ -7,8 +7,8 @@ on:
 
 env:
   NODE_VERSION: '18'
-  AZURE_WEBAPP_NAME: 'your-api-app'
-  AZURE_STATIC_WEB_APP_NAME: 'your-frontend-app'
+  AZURE_WEBAPP_NAME: 'saas-learning-api-mohit'
+  AZURE_STATIC_WEB_APP_NAME: 'salmon-sand-08e8bec1e'
 
 jobs:
   deploy-backend:

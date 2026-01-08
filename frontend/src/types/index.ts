@@ -3,19 +3,23 @@
 // ============================================
 
 // User Roles
-export enum Role {
-    OWNER = 'owner',
-    ADMIN = 'admin',
-    EDITOR = 'editor',
-    VIEWER = 'viewer',
-}
+export const Role = {
+    OWNER: 'owner',
+    ADMIN: 'admin',
+    EDITOR: 'editor',
+    VIEWER: 'viewer',
+} as const;
+
+export type Role = typeof Role[keyof typeof Role];
 
 // Tenant Status
-export enum TenantStatus {
-    ACTIVE = 'active',
-    SUSPENDED = 'suspended',
-    DELETED = 'deleted',
-}
+export const TenantStatus = {
+    ACTIVE: 'active',
+    SUSPENDED: 'suspended',
+    DELETED: 'deleted',
+} as const;
+
+export type TenantStatus = typeof TenantStatus[keyof typeof TenantStatus];
 
 // ============================================
 // User Types
@@ -189,11 +193,11 @@ export interface ModalState {
 // Permission Helpers
 // ============================================
 
-export const canEdit = (role?: Role): boolean => {
+export const canEdit = (role?: Role | null): boolean => {
     return role === Role.OWNER || role === Role.ADMIN || role === Role.EDITOR;
 };
 
-export const canAdmin = (role?: Role): boolean => {
+export const canAdmin = (role?: Role | null): boolean => {
     return role === Role.OWNER || role === Role.ADMIN;
 };
 

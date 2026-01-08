@@ -9,11 +9,15 @@ export const config = {
 
     // Database
     database: {
-        host: process.env.DB_HOST || 'localhost',
-        name: process.env.DB_NAME || 'saas_db',
+        server: process.env.DB_SERVER || process.env.DB_HOST || 'localhost',
+        database: process.env.DB_DATABASE || process.env.DB_NAME || 'saas_db',
         user: process.env.DB_USER || 'sa',
         password: process.env.DB_PASSWORD || '',
         port: parseInt(process.env.DB_PORT || '1433', 10),
+        options: {
+            encrypt: process.env.DB_ENCRYPT === 'true' || process.env.NODE_ENV === 'production',
+            trustServerCertificate: process.env.NODE_ENV !== 'production',
+        },
     },
 
     // Azure AD B2C
@@ -26,18 +30,20 @@ export const config = {
 
     // Azure Storage
     azureStorage: {
-        accountName: process.env.AZURE_STORAGE_ACCOUNT_NAME || '',
-        accountKey: process.env.AZURE_STORAGE_ACCOUNT_KEY || '',
-        containerName: process.env.AZURE_STORAGE_CONTAINER_NAME || 'attachments',
+        accountName: process.env.AZURE_STORAGE_ACCOUNT || process.env.AZURE_STORAGE_ACCOUNT_NAME || '',
+        accountKey: process.env.AZURE_STORAGE_KEY || process.env.AZURE_STORAGE_ACCOUNT_KEY || '',
+        containerName: process.env.AZURE_STORAGE_CONTAINER || process.env.AZURE_STORAGE_CONTAINER_NAME || 'attachments',
     },
 
-    // JWT (for development)
+    // JWT
     jwt: {
         secret: process.env.JWT_SECRET || 'dev-secret-change-me',
-        expiresIn: process.env.JWT_EXPIRES_IN || '24h',
+        expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+        refreshSecret: process.env.REFRESH_TOKEN_SECRET || 'dev-refresh-secret-change-me',
+        refreshExpiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || '7d',
     },
 
-    // CORS
+    // CORSCORS_ORIGIN || process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map(origin => origin.trim()
     cors: {
         allowedOrigins: (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(','),
     },

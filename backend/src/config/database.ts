@@ -6,15 +6,15 @@ import { logger } from '../utils/logger';
  * Database Configuration for Azure SQL / SQL Server
  */
 const dbConfig: sql.config = {
-    server: config.database.host,
-    database: config.database.name,
+    server: config.database.server,
+    database: config.database.database,
     user: config.database.user,
     password: config.database.password,
     port: config.database.port,
     options: {
-        encrypt: true, // Required for Azure SQL
+        encrypt: config.database.options.encrypt, // Required for Azure SQL
         enableArithAbort: true,
-        trustServerCertificate: config.nodeEnv === 'development', // Only for local dev
+        trustServerCertificate: config.database.options.trustServerCertificate, // Only for local dev
     },
     pool: {
         max: 10,
@@ -39,8 +39,8 @@ export const initializeDatabase = async (): Promise<void> => {
             await pool.connect();
             isConnected = true;
             logger.info('Database connected successfully', {
-                server: config.database.host,
-                database: config.database.name,
+                server: config.database.server,
+                database: config.database.database,
             });
         }
     } catch (error) {

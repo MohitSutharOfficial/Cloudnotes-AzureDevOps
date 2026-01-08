@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { X, Save, Paperclip, Upload, Trash2 } from 'lucide-react';
+import { X, Save, Paperclip, Trash2 } from 'lucide-react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
-import { Button, Input } from '../common';
+import { Button } from '../common';
 import { useAuthStore, toast } from '../../stores';
 import { notesApi, attachmentsApi } from '../../services/api';
 import type { Note, Attachment } from '../../types';
