@@ -101,6 +101,19 @@ apiRouter.use('/members', memberRoutes);
 apiRouter.use('/notes', noteRoutes);
 apiRouter.use('/attachments', attachmentRoutes);
 
+// Root endpoint for basic health check
+app.get('/', (req, res) => {
+    res.json({
+        success: true,
+        message: 'Multi-Tenant SaaS API',
+        version: '1.0.0',
+        endpoints: {
+            health: '/api/v1/health',
+            auth: '/api/v1/auth',
+        },
+    });
+});
+
 // Mount API routes with versioning
 app.use('/api/v1', apiRouter);
 
@@ -118,15 +131,33 @@ app.use(errorHandler);
 // ============================================
 const startServer = async () => {
     try {
+        // Log startup configuration (without sensitive data)
+        logger.info('Starting server', {
+            nodeEnv: config.nodeEnv,
+            port: config.port,
+            hasDbServer: !!config.database.server,
+            hasDbPassword: !!config.database.password,
+            corsOrigins: config.cors.allowedOrigins,
+        });
+
         // Initialize Application Insights for production monitoring
         initializeAppInsights();
 
         // Initialize database connection
         try {
+            logger.info('Attempting database connection...', {
+                server: config.database.server,
+                database: config.database.database,
+            });
             await initializeDatabase();
             logger.info('✓ Database initialized');
         } catch (dbError) {
-            logger.warn('Database initialization failed - app will run with limited functionality', { error: dbError });
+            logger.error('Database initialization failed', {
+                error: dbError,
+                server: config.database.server,
+                database: config.database.database,
+            });
+            console.error('❌ Database connection failed:', dbError);
             // Don't crash - allow app to start for health checks
         }
 

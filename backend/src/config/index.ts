@@ -43,9 +43,9 @@ export const config = {
         refreshExpiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || '7d',
     },
 
-    // CORSCORS_ORIGIN || process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map(origin => origin.trim()
+    // CORS
     cors: {
-        allowedOrigins: (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(','),
+        allowedOrigins: (process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',').map(origin => origin.trim()),
     },
 
     // Rate Limiting
